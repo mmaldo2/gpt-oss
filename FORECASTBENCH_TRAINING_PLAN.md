@@ -32,12 +32,17 @@ Brier score (lower is better).
 **Current state of the art:**
 - Superforecasters: ~0.081 Brier score (the target to beat)
 - Best LLM (GPT-4.5): ~0.101 Brier score
+- AIA Forecaster (Bridgewater): ~0.108 Brier -- first AI system statistically
+  indistinguishable from superforecasters, using agentic search + calibration
+  correction + ensemble reconciliation
 - LLM-superforecaster parity projected: ~November 2026
 
 **Our approach:** Fine-tune an open-source reasoning model using a three-stage
 pipeline (SFT -> GRPO -> calibration), leveraging ForecastBench's own historical
 data plus synthetic forecasting data, with a scaffolding harness that provides
-the model with retrieval and search capabilities at inference time.
+the model with agentic search capabilities at inference time (following the AIA
+Forecaster's demonstration that agentic search significantly outperforms simple
+RAG for forecasting).
 
 ---
 
@@ -72,6 +77,36 @@ near-certain events. The winning strategy is:
 2. Retrieve up-to-date information (the model gets a 24-hour window)
 3. Reason about base rates, reference classes, and update factors
 4. Output a well-calibrated probability (not just "likely" or "unlikely")
+
+### Important Caveats
+
+**Market forecast copying**: When LLMs are given crowd/market probabilities as
+context, many simply copy them (GPT-4.5 shows 0.994 correlation with provided
+market forecasts). Since markets are well-calibrated, this "shortcut" produces
+strong scores but doesn't demonstrate genuine forecasting reasoning. Our model
+should learn to use market forecasts as *one input* among many, not blindly copy
+them.
+
+**Difficulty-adjusted scoring**: ForecastBench uses difficulty-adjusted Brier
+scores (OLS-estimated question-difficulty fixed effects subtracted from raw
+scores) because different models predict on different question sets. This method
+achieves 0.91 Spearman correlation with ground-truth rankings.
+
+### Prior Art: AIA Forecaster (Bridgewater)
+
+The AIA Forecaster is the first AI system to achieve statistically
+indistinguishable performance from superforecasters on ForecastBench
+(Brier 0.1076-0.1099). Its architecture provides a blueprint:
+
+1. **Agentic search** over high-quality news sources (0.1140 Brier vs 0.1230
+   for no-search -- agentic search significantly outperformed simple RAG)
+2. **Calibration correction** using statistical techniques to counter LLM
+   overconfidence and acquiescence bias (tendency to predict above 0.5)
+3. **Supervisor/reconciliation agent** that merges disparate forecasts from
+   multiple sub-forecasters into a coherent final prediction
+4. **Ensemble of forecasting approaches** for variance reduction
+
+We should incorporate these architectural patterns into our inference harness.
 
 ### Submission Format
 
@@ -550,6 +585,23 @@ trainer.train()
 - `learning_rate`: 1e-7 to 1e-6 (RL requires very small steps)
 - `temperature`: 0.7-1.0 (needs diversity in generations for GRPO to work)
 
+**Validated in practice**: An R1-14B model improved from Brier 0.214 to 0.197
+(matching OpenAI o1) through GRPO+ReMax with real-time Brier score rewards,
+achieving calibration ECE of ~0.042.
+
+**Alternative: DAPO** (Decoupled Clip and Dynamic Sampling Policy Optimization):
+An open-source RL system from ByteDance that removes the KL penalty term entirely,
+using only verifiable rewards. DAPO achieved 50% on AIME 2024 with Qwen2.5-32B
+trained from near 0%. Available via OpenRLHF or verl framework. Worth testing
+alongside GRPO, especially since removing the KL penalty may allow the model to
+explore more calibrated probability distributions.
+
+**Critical warning: RLHF hurts calibration.** Multiple papers found that standard
+RLHF degrades probability calibration (GPT-4 is worse-calibrated than GPT-3).
+This is why we use GRPO/DAPO with verifiable Brier-score rewards rather than
+learned reward models. If trying DPO as a fallback, it preserves calibration
+better than PPO-based RLHF.
+
 ### Step 3.3: Monitor Training
 
 Watch for:
@@ -562,10 +614,14 @@ Watch for:
 
 ## Phase 4: Inference Harness & Submission Pipeline
 
-### Retrieval-Augmented Forecasting
+### Agentic Search (Not Simple RAG)
 
-At inference time, the model benefits greatly from current information. Build a
-retrieval pipeline:
+The AIA Forecaster demonstrated that **agentic search significantly outperforms
+simple retrieval** (Brier 0.1140 vs 0.1230). The key difference: agentic search
+iteratively refines queries based on what it finds, follows leads, and synthesizes
+across multiple sources -- rather than doing a single search-and-stuff.
+
+Build an agentic search pipeline:
 
 ```
 Question received (0:00 UTC)
@@ -574,23 +630,32 @@ Question received (0:00 UTC)
 [Question Parser] -> Extract key entities, dates, topics
   |
   v
-[Web Search] -> Search for latest news, data updates
-  |          -> Use search APIs (Brave, Exa, SerpAPI)
+[Agentic Search Loop] (iterative, not one-shot):
+  |  1. Generate initial search queries from question
+  |  2. Execute searches (Brave, Exa, SerpAPI)
+  |  3. Analyze results -- identify gaps, follow-up questions
+  |  4. Generate refined queries based on what was found
+  |  5. Repeat 2-4 times until sufficient context gathered
+  |  6. For dataset questions: also fetch latest values from
+  |     FRED API, Yahoo Finance API, ACLED API directly
   |
   v
-[Data Retrieval] -> For dataset questions:
-  |               -> Fetch latest values from FRED, Yahoo Finance, etc.
+[Context Assembly] -> Combine question + all retrieved context
+  |                -> Deduplicate and rank by relevance
   |
   v
-[Context Assembly] -> Combine question + retrieved context
+[Multi-Forecaster Inference] -> Run fine-tuned model 3-5 times
+  |  - Vary temperature (0.3, 0.5, 0.7)
+  |  - Optionally vary prompts (different reasoning frameworks)
   |
   v
-[Model Inference] -> Run fine-tuned model
-  |                -> Parse probability output
+[Supervisor/Reconciliation] -> Merge multiple forecasts
+  |  - Detect and resolve contradictions in reasoning
+  |  - Weight by reasoning quality
+  |  - Produce single coherent forecast + reasoning
   |
   v
-[Ensemble / Post-Processing] -> Optional: average across multiple runs
-  |                           -> Apply temperature/Platt scaling
+[Calibration Post-Processing] -> Apply isotonic/temperature scaling
   |
   v
 [Submission Formatter] -> Generate ForecastBench JSON
@@ -598,6 +663,9 @@ Question received (0:00 UTC)
   v
 [Upload to GCP] -> Submit within 24-hour window
 ```
+
+This architecture mirrors the AIA Forecaster's approach: agentic search, multiple
+sub-forecasters, supervisor reconciliation, and calibration correction.
 
 ### Calibration Post-Processing
 
@@ -750,7 +818,9 @@ gpt-oss/                              # This repo (fork)
       probability_parser.py
       submission_formatter.py
       evaluator.py
-      retrieval.py
+      agentic_search.py            # Iterative search with query refinement
+      supervisor.py                # Multi-forecast reconciliation agent
+      retrieval.py                 # Direct API calls (FRED, Yahoo Finance, etc.)
     scripts/
       run_baseline.py
       run_evaluation.py
@@ -896,13 +966,22 @@ This project is structured so each phase teaches a distinct skill:
 - TRL (GRPO, SFT, DPO): https://huggingface.co/docs/trl
 - Axolotl: https://github.com/axolotl-ai-cloud/axolotl
 - LLaMA-Factory: https://github.com/hiyouga/LLaMA-Factory
+- OpenRLHF (GRPO/DAPO at scale): https://github.com/OpenRLHF/OpenRLHF
+- DAPO paper: https://arxiv.org/abs/2503.14476
 
 ### Forecasting Methodology
 - Superforecasting (Tetlock): https://en.wikipedia.org/wiki/Superforecasting
 - Calibration training: https://calibrateduncertainty.org/
 - Brier score: https://en.wikipedia.org/wiki/Brier_score
+- Metaculus Forecasting Tools: https://github.com/Metaculus/forecasting-tools
 
 ### Related Papers
-- AIA Forecaster (LLM forecasting system): https://arxiv.org/abs/2511.07678
+- AIA Forecaster (superforecaster-level AI): https://arxiv.org/abs/2511.07678
+- Approaching Human-Level Forecasting with LMs (NeurIPS 2024): https://arxiv.org/abs/2402.18563
+- Wisdom of the Silicon Crowd (Science Advances 2024): https://www.science.org/doi/10.1126/sciadv.adp1528
 - Calibrating Verbalized Probabilities for LLMs: https://arxiv.org/abs/2410.06707
 - Thermometer (Universal LLM Calibration): https://arxiv.org/abs/2406.15309
+- LLMs Must Be Taught to Know What They Don't Know (NeurIPS 2024): calibration fine-tuning
+- Leveraging Log Probabilities for Forecasting: https://arxiv.org/abs/2501.04880
+- ForecastBench Methodology Update: https://forecastbench.org/assets/pdfs/forecastbench_updated_methodology.pdf
+- Open-R1 (reproducing DeepSeek-R1 training): https://huggingface.co/blog/open-r1
